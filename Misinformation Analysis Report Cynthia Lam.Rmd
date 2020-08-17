@@ -1,0 +1,437 @@
+---
+title: "Misinformation Analysis Report"
+author: "Cynthia Lam"
+date: "8/10/2020"
+output: pdf_document
+geometry: "left=1in,right=1in,top=0.35in,bottom=0.6in"
+urlcolor: cyan
+always_allow_html: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(magrittr)
+library(knitr)
+library(readr)
+library(dplyr)
+library(tidyverse)
+library(caret)
+library(stringr)
+library(ggplot2)
+library(rpart)
+library(tidytext)
+if(!require(tm)) install.packages("tm")
+library(tm)
+if(!require(textstem)) install.packages("textstem")
+library(textstem)
+if(!require(wordcloud2)) install.packages("wordcloud2")
+library(wordcloud2)
+if(!require(randomForest)) install.packages("randomForest")
+library(randomForest)  
+if(!require(naivebayes)) install.packages("naivebayes")
+library(naivebayes)
+if(!require(webshot)) install.packages("webshot")
+library(webshot)
+if(!require(htmlwidgets)) install.packages("htmlwidgets")
+library(htmlwidgets)
+library(magick)
+```
+
+
+\tableofcontents
+
+## 1. Introduction
+Misinformation is any inaccurate information, while disinformation refers to information fabricated deliberatively intended to deceive.
+In a time like this, the complicated political situation and the COVID-19 pandemic, together with the rapid propagation of information on social media, have enabled a rapid increase in the amount of information, which is often referred to as "an infodemic" (Zarocostas, 2020). This overabundance of information consists of both accurate and inaccurate information (misinformation and disinformation), making it challenging for the general public to distinguish facts from fake news.
+
+This project aims to explore a dataset of news articles published in the US (Bisaillon, 2020) and develop a model based on the text mined from the dataset to predict news accuracy.
+The report outlines the methodology of data exploration and wrangling, as well as building a model to predict information accuracy/validity using Naive Bayes, LDA, LQA, GLM, KNN and Random Forest. To evaluate the performance of the models, the accuracy of prediction will be performed on the test set across all models.
+
+## 2. Methods
+### 2.1 Preprocessing - Data Preparation
+```{r Data Prep, warning=FALSE, message=FALSE}
+url <- "https://github.com/thialam/Misinformation-Analysis/raw/master/True.csv"
+True <- read_csv(url)
+url <- "https://github.com/thialam/Misinformation-Analysis/raw/master/Fake.csv"
+Fake <- read_csv(url)
+True <- True %>% mutate(validity = 1) #adding a column for validity where 1 = true
+Fake <- Fake %>% mutate(validity = 0) #where 0 = fake
+news <- full_join(True,Fake) #combining both dataframes 
+news <- news %>% filter(!is.na(text))
+set.seed(1, sample.kind = "Rounding")
+news <- sample_n(news,20000) #sampling 20000 from the dataset to accommodate the limited computational power
+news$validity <- as.factor(news$validity)
+news$subject <- as.factor(news$subject)
+```
+
+To ease data downloading to R, I have downloaded the dataset from Kaggle and re-uploaded it to my Github, but the dataset is the same as the original one from Kaggle. The original dataset is >40K long and each data entry (row) contains a lot of textual data (it is the entire article in one row), we will only sample 20K entries from the dataset after removing rows with NAs.
+
+### 2.2 Preprocessing - Data Exploration and Wrangling
+In the process of exploring the data through visualisations, a few problems about the dataset have been identified. Hence, we will also perform data cleaning and wrangling in this section.
+#### 2.2.1 Inspecting the given data and basic cleaning
+Let's take a look at the first few rows of the original dataset.
+
+```{r data head, echo=FALSE}
+head(news)
+```
+
+We can see it consists of 5 variables - title, text, date, subject (category) and validity (whether it is true or fake).
+First, we inspect whether the dataset is balanced in terms of validity:
+
+```{r vis 1, echo=FALSE}
+ggplot(news, aes(x = validity, fill = validity)) + #is the data balanced?
+  geom_bar() +
+  theme_classic() +
+  theme(axis.title = element_text(face = 'bold', size = 15),
+        axis.text = element_text(size = 13)) +
+  theme(legend.position = 'none') +
+  ggtitle("Is the data balanced in terms of validity?")    
+```
+
+Then, we look at whether the dataset is balanced in terms of subjects (news categories).
+
+```{r vis 2, echo=FALSE}
+ggplot(news, aes(x = subject, fill = validity)) + #is the data balanced in every subject?
+  geom_bar(position = 'dodge', alpha = 0.6) +
+  theme_classic() +
+  theme(axis.title = element_text(face = 'bold', size = 15),
+        axis.text = element_text(size = 13, angle = 90)) +
+  ggtitle("Is the data balanced in every subject?")    
+```
+
+We can see that the data is skewed - the subjects that are present in "true" set are not present in the "fake" set. In other words, we need to remove subjects from the dataset as using it as correlating factors produce unreasonably accurate results.
+
+```{r delete subject, warning=FALSE, message=FALSE}
+news<-news[-3] #turns out the subjects are completely different in the categories, so we need to delete the subject column 
+```
+
+Let's also inspect the distribution of the lengths of the text
+
+```{r vis 3 length, echo=FALSE}
+news %>% mutate(length=sapply(strsplit(news$text, " "), length)) %>% #length of the text
+  group_by(validity) %>% 
+  ggplot(aes(x=length, y=..count.., fill = validity)) +
+  geom_density(alpha=0.6) +
+  theme_classic() + ggtitle("Length of the text")    
+
+```
+
+We can see that the distributions overlap, indicating the length does not seem to be a good predictor.
+
+We will also  combine the title and text column and give each row a unique ID for further wrangling later.
+
+```{r ID, warning=FALSE, message=FALSE}
+news <- news %>% # Combine 'title' & 'text' column
+  unite(col = text ,title, text, sep = ' ')  %>%  
+  mutate(ID = as.character(1:nrow(news))) #add a unique ID for each row 
+```
+
+
+
+#### 2.2.2 Text mining
+
+Articles are very content-rich, but it also constitutes many components that are not informative in this case, such as numbers, punctuations, stopwords (e.g. and, is, a an, etc.) To perform text mining, "tm" (Feinerer, 2019) and "textstem" (Rinker, 2018) packages are required.
+
+```{r corpus text mining, tidy=TRUE, tidy.opts=list(width.cutoff=50), warning=FALSE, message=FALSE}
+text <- VCorpus(VectorSource(news$text)) #create a corpus for tm for text mining and cleaning
+writeLines(as.character(text[[1]]))
+text <- tm_map(text, content_transformer(tolower))
+text <- tm_map(text, removeNumbers)
+text <- tm_map(text, content_transformer(str_remove_all), "[[:punct:]]")
+text <- tm_map(text, removeWords, stopwords('english'))
+text <- tm_map(text, stripWhitespace)
+
+paragraph1 <- as.character(text[[1]]) #inspect to see if all the uninformative words and punctuations have been removed
+print(paragraph1)
+
+```
+Here, we can see the differences made after removing the uninformative components, but there is more we can do to further condense the information, by utilising lemmatisation. Lemmatisation  refers to removing inflectional endings to return the base or dictionary form of a word (known as the lemma) by morphological analysis of words (Manning and Schutze, 1999). 
+
+```{r lemmatisation, tidy=TRUE, tidy.opts=list(width.cutoff=50), warning=FALSE, message=FALSE}
+text <- tm_map(text, content_transformer(lemmatize_strings)) #remove  strings to return only the meaningful "base" words
+paragraph2 <- as.character(text[[1]]) #inspect to see if inflectional endings have been removed and only word bases are retained
+print(paragraph2)
+```
+
+Here, we can see the returned text only contains the lemma - we are now ready to utilise the cleaned data.
+
+Next, we create document term matrix to inspect the popularity of words and also transition into a clean dataframe.
+
+```{r DTM, warning=FALSE, message=FALSE}
+dtm <- DocumentTermMatrix(text) #create document term matrix to view the popularity of words and also transition into a clean dataframe
+dtm <- removeSparseTerms(dtm, sparse = 0.99) #remove sparse terms
+inspect(dtm)
+df <- tidy(dtm)
+```
+
+What are the top terms?
+
+```{r top terms, echo=FALSE, warning=FALSE, message=FALSE}
+df %>% inner_join(news, by = c('document' = 'ID')) %>% #top terms 
+  select(-document) %>%
+  group_by(term) %>%
+  summarize(freq = sum(count)) %>%
+  arrange(desc(freq)) 
+```
+
+What about the top terms for fake and real news respectively?
+
+```{r top fake real terms, warning=FALSE, message=FALSE}
+realwords <- df %>% inner_join(news, by = c('document' = 'ID')) %>% 
+  select(-document) %>%
+  filter(validity==1) %>%
+  group_by(term) %>%
+  summarize(real_freq = sum(count)) %>%
+  arrange(desc(real_freq))
+realwords
+
+fakewords <- df %>% inner_join(news, by = c('document' = 'ID')) %>% #top terms for fake news
+    select(-document) %>%
+    filter(validity==0) %>%
+    group_by(term) %>%
+    summarize(fake_freq = sum(count)) %>%
+    arrange(desc(fake_freq))
+fakewords
+```
+
+Let's visualise the frequency of the terms better using word cloud.
+
+For real news:
+
+```{r wordcloud real, echo=FALSE, warning=FALSE, message=FALSE}
+realcloud <- df %>% #wordcloud for real news
+  inner_join(news, by = c('document' = 'ID')) %>% 
+  select(-text) %>%
+  filter(validity == 1) %>%
+  select(-validity) %>%
+  group_by(term) %>%
+  summarize(freq = sum(count)) %>%
+  arrange(desc(freq)) %>%
+  wordcloud2(size = 1.5,  color='random-dark')
+
+saveWidget(realcloud, "tmp.html", selfcontained = F)
+webshot::webshot("tmp.html", "wc1.png", delay = 15, vwidth = 1000, vheight = 1000)
+```
+
+
+
+For fake news:
+
+```{r wordcloud fake, echo=FALSE, warning=FALSE, message=FALSE}
+fakecloud <- df %>% #wordcloud for fake news
+  inner_join(news, by = c('document' = 'ID')) %>% 
+  select(-text) %>%
+  filter(validity == 0) %>%
+  select(-validity) %>%
+  group_by(term) %>%
+  summarize(freq = sum(count)) %>%
+  arrange(desc(freq)) %>%
+  wordcloud2(size = 1.6,  color='random-dark')
+  
+saveWidget(fakecloud, "tmp2.html", selfcontained = F)
+webshot("tmp2.html", "wc2.png", delay = 5, vwidth = 1000, vheight = 1000)
+```
+
+
+We can see that the popularity of different terms varries across the two datasets. Next, we combine the two lists with the frequencies for both fake and real news and calculate the ratio of fake frequency/total frequency.
+
+```{r terms list, warning=FALSE, message=FALSE}
+termslist <- fakewords %>% full_join(realwords, by = c('term'='term')) #combine the two lists
+termslist <- termslist %>% mutate (ratio = fake_freq/(real_freq+fake_freq)) #find out the ratio for fake/real 
+```
+
+There are too many terms and the computer will not be able to manage, so we are only filtering to only keep the terms with frequency higher than 1500 in either category, as well as with a ratio of larger than 0.65 or smaller than 0.35. Please note this is not ideal and the thresholds set for the frequency and ratio are arbitrary - if computational power allows, please try to perform the training using the full terms list.
+
+```{r filtering terms list, warning=FALSE, message=FALSE}
+sectermslist <- termslist %>%  
+  arrange(desc(ratio)) %>% 
+  filter(!(ratio <=0.65 & ratio >=0.35)) %>%
+  filter(!(fake_freq<=1500 & real_freq <=1500)) %>%
+  filter(!grepl('reuters', term)) #removing "Reuters" as it makes the data too biased - with a ratio of 0.015
+
+```
+
+The term "reuters" is also removed as with a ratio of 0.015, it makes the data highly biased. In real life scenario, not that many real news articles contain the word "reuters". If we included it in the dataset, it would have caused overfitting with this current dataset.
+
+
+### 2.3 Dataset cleaning and train/test preparation
+Now we have a dataframe of segregated, informative terms - we need to combine it back with the news dataframe with validity before partitioning our data into training and testing sets. We can see now each row contains information about the article, its validity and the frequencies of different important terms we have identified through text mining in the article.
+
+An 80/20 train/test split has been adopted based on the Pareto Principle (80% of effects come from 20% of causes (Bunkley,2008))
+
+```{r data prepataion, warning=FALSE, message=FALSE}
+news$validity <- as.factor(news$validity)
+news1 <- df %>% #combining the dataframe of segregated informative terms back with the news frame
+  filter(df$term %in% sectermslist$term) %>% #only selecting the selected terms we filtered out
+  inner_join(news, by = c('document' = 'ID')) %>%
+  spread(term,count) %>% #reshape the data so each document takes up one row
+  mutate_all(~ifelse(is.na(.), 0, .)) %>%  #turn NA into 0
+  select(-c(document, date, text)) #removing document ID, date and the full text
+
+head(news1)
+
+set.seed(1, sample.kind="Rounding")
+test_index <- createDataPartition(y = news1$validity, times = 1,
+                                  p = 0.2, list = FALSE)
+train_set <- news1[-test_index,]
+test_set <- news1[test_index,]
+train_set$validity <- as.factor(train_set$validity)
+test_set$validity <- as.factor(test_set$validity)
+table(train_set$validity) #is it balanced?
+table(test_set$validity)
+```
+
+We finished preprocessing of the data - now we are ready to work on building our models.
+
+### 2.4 Models training
+We will be utilising Naive Bayes, LDA, QDA, GLM, KNN and Random Forest to build different models for prediction.
+
+
+#### 2.4.1 Naive Bayes
+
+First, we utilised Naive Bayes, which is a kind of simple "probabilistic classifiers" based on applying Bayes' theorem with strong independence assumptions between the features (McCallum, 2019). 
+
+We will inspect the confusion matrix for each model, but the comparison will be made based on only the overall accuracy. A table is built to store the accuracy for comparison later.
+```{r NB, warning=FALSE, message=FALSE}
+train_nb <- naive_bayes(validity ~ ., data = train_set)
+y_hat0 <- predict(train_nb, newdata = test_set)
+confusionMatrix(data = y_hat0, reference = test_set$validity)
+mean0 <- mean(y_hat0 == test_set$validity)
+results <- data_frame(Method = "Naive Bayes", Accuracy = mean0)
+results %>% knitr::kable()
+
+```
+
+
+#### 2.4.2 Linear Discriminant Analysis 
+Next, we utilise Linear Discriminant Analysis (LDA). LDA reduces dimentionality of the data by projecting the input to a linear subspace. (Sckit Learn, 2020)
+
+```{r LDA, warning=FALSE, message=FALSE}
+set.seed(1, sample.kind = "Rounding")
+train_lda <- train(validity ~ ., method = "lda", data = train_set)
+y_hat1 <- predict(train_lda, test_set)
+mean1 <- mean(y_hat1 == test_set$validity)
+confusionMatrix(data = y_hat1, reference = test_set$validity)
+results <- bind_rows(results,
+                     data_frame(Method="LDA",
+                                Accuracy = mean1 ))
+results %>% knitr::kable()
+
+```
+
+
+#### 2.4.3 Quadratic Discriminant Analysis
+Quadratic Discriminant Analysis (QDA) is a sister to LDA, where it also acts in the same vein but now with a quadratic decision surface.
+
+```{r QDA, warning=FALSE, message=FALSE}
+set.seed(1, sample.kind = "Rounding")
+train_qda <- train(validity ~ ., method = "qda", data = train_set)
+y_hat2 <- predict(train_qda, test_set)
+mean2 <- mean(y_hat2 == test_set$validity)
+confusionMatrix(data = y_hat2, reference = test_set$validity)
+results <- bind_rows(results,
+                     data_frame(Method="QDA",
+                                Accuracy = mean2 ))
+results %>% knitr::kable()
+
+```
+
+We can see it outperforms LDA quite significantly.
+
+#### 2.4.4 Generalized linear model
+In general linear model (GLM), general refers to predicting using more than one explanatory variable (v.s. the simple linear model). It is made up of a linear predictor, a link function and a variance function.
+
+```{r GLM, warning=FALSE, message=FALSE}
+set.seed(1, sample.kind = "Rounding")
+train_glm <- train(validity ~ ., method = "glm", data = train_set)
+y_hat3 <- predict(train_glm, test_set)
+mean3 <- mean(y_hat3 == test_set$validity)
+confusionMatrix(data = y_hat3, reference = test_set$validity)
+results <- bind_rows(results,
+                     data_frame(Method="GLM",
+                                Accuracy = mean3 ))
+results %>% knitr::kable()
+varImp(train_glm)
+```
+It outperforms LDA or QDA.
+
+#### 2.4.5 K Nearest Neighbours
+K-nearest neighbours is a function where we approximate the function locally based on the neighbouring objects.
+However, what is the optimal number for K that we should use? We will also do one with k-fold cross-validation to find out:
+
+```{r KNN CV, warning=FALSE, message=FALSE}
+set.seed(1, sample.kind = "Rounding")
+control <- trainControl(method = "cv", number = 10, p = .9)
+train_knn_cv <- train(validity ~ ., method = "knn", 
+                      data = train_set,
+                      tuneGrid = data.frame(k = seq(3, 51, 2)),
+                      trControl = control)
+ggplot(train_knn_cv, highlight = TRUE)
+train_knn_cv$bestTune
+y_hat5 <- predict(train_knn_cv,test_set) 
+mean5 <- mean(y_hat5 == test_set$validity)
+confusionMatrix(data = y_hat5, reference = test_set$validity)
+results <- bind_rows(results,
+                     data_frame(Method="KNN + Cross Validation",
+                                Accuracy = mean5 ))
+results %>% knitr::kable()
+
+```
+
+With the optimisation, the accuracy is significantly improved.
+
+#### 2.4.6 Random Forest
+Finally, we investigate Random Forest. Random Forest expands on classification tree - it grows an ensenble of classification trees and derives the mean prediction from the classification results produced by different trees. It addresses decision tree's flaw of overfitting to the training set.
+
+```{r RF, warning=FALSE, message=FALSE}
+set.seed(1, sample.kind = "Rounding")
+train_rf<- train(validity ~ ., method ="rf", data = train_set, ntree=50, tuneGrid = data.frame(mtry=seq(1,7,1)))
+train_rf$bestTune
+y_hat7 <- predict(train_rf,test_set) 
+mean7 <- mean(y_hat7 == test_set$validity)
+varImp(train_rf) #let's inspect the most important 
+confusionMatrix(data = y_hat7, reference = test_set$validity)
+results <- bind_rows(results,
+                    data_frame(Method="Random Forest",
+                                     Accuracy = mean7 ))
+results %>% knitr::kable()
+```
+
+Random Forest is the best performig model out of all.
+
+## 3. Results
+The accuracy using the different model is as follows:
+
+```{r Final results, echo=F, warning=FALSE, message=FALSE}
+results %>% arrange(desc(Accuracy)) %>% knitr::kable()
+```
+
+6 different methods have been tested, among which Random Forest out performs, arriving at an accuracy of 0.966.
+
+
+## 4. Discussion and Conclusion
+In this project, we first inspected the dataset and removed the subject column that would have caused biased results, then we performed textmining by harnessing the "tm" and "textstem" packages to remove uninformative words and return the meaningful, single base terms of words that are both stemmed and lemmatised. 
+
+Next, we inspect the frequencies and ratio of frequencies of those terms in the real and fake news sets, removing "Reuters" as it causes the dataset to be too biased as well as terms with a frequency too low or a ratio between 0.35-0.65 - author acknowledges the thresholds set for the frequency and ratio are arbitrary; this only presents a workaround for the limited computational power. 
+
+After the preprocessing, we performed different models - namely Naive Bayes, LDA, LQA, GLM, KNN and Random Forest on the datasets and compare the performance of each model by comparing the overall accuracy. Random Forest outperforms all models, arriving at an accuracy of 0.966.
+
+The key lessons learned from this project are as follows:
+
+- Data exploration and preprocessing is a crucial step for us to understand the nature, strengths and limitations of the dataset. 
+
+- It is important to remove elements that caused the dataset to be biased. If we did not remove the subject column as well as the term "Reuters", the models would be overfitting to this dataset. The aim of this project is to utilise text mining to derive terms that can be used as predictors for whether the article is real or fake.
+
+- For this project, the key challenge does not lie in fitting the models, but at processing the data and performing appropriate text mining to allow the models to work on the substantial textual data and only utilise the important elements hidden between.
+
+## 5. Bibliography
+* Zarocostas, J. (2020). How to fight an infodemic. The Lancet, 395(10225), 676.
+* Bisaillon, C (2020) Fake and real news dataset. Retrieved from https://www.kaggle.com/clmentbisaillon/fake-and-real-news-dataset
+* Manning, C. and Schutze, H. (1999). Foundations of Statistical Natural Language Processing (1999) Retrieved from https://nlp.stanford.edu/fsnlp/
+* Feinerer, I, Hornik, K. (2019) "tm" R package. Retrieved from https://cran.r-project.org/web/packages/tm/tm.pdf
+* Rinker, T. (2018) "textstem" R package. Retrieved from https://cran.r-project.org/web/packages/textstem/index.html
+* Bunkley, N (March 3, 2008) Joseph Juran, 103, Pioneer in Quality Control, Dies. The New York Times.
+* McCallum, A (2019) Graphical Models, Lecture2: Bayesian Network Represention. Retrieved from https://people.cs.umass.edu/~mccallum/courses/gm2011/02-bn-rep.pdf
+* Sckit Learn (2020) Linear and Quadratic Discriminant Analysis. Retrieved from https://scikit-learn.org/stable/modules/lda_qda.html
+* Rokach, L; Maimon, O. (2008). Data mining with decision trees: theory and applications. World Scientific Pub Co Inc. ISBN 978-9812771711.
